@@ -47,7 +47,7 @@
           <button
             type="button"
             class="place-order-btn"
-            :disabled="recommendations.length === 0 || submitting"
+            :disabled="recommendations.length === 0 || submitting || loading || isStale"
             @click="placeOrder"
           >
             {{ submitting ? t('restocking.placingOrder') : t('restocking.placeOrder') }}
@@ -93,7 +93,7 @@
 </template>
 
 <script>
-import { ref, onMounted, watch, computed } from 'vue'
+import { ref, onMounted, onUnmounted, watch, computed } from 'vue'
 import { api } from '../api'
 import { useI18n } from '../composables/useI18n'
 
@@ -118,21 +118,33 @@ export default {
     const successMessage = ref(null)
 
     let debounceTimer = null
+    // Budget the displayed recommendations were computed for; also true while a reload is pending
+    const loadedBudget = ref(null)
+    // Incremented per request so a slow, older response can't overwrite a newer one
+    let requestSeq = 0
 
     const loadRecommendations = async () => {
+      const seq = ++requestSeq
+      const requestedBudget = budget.value
       try {
         loading.value = true
         error.value = null
-        const data = await api.getRestockRecommendations(budget.value)
+        const data = await api.getRestockRecommendations(requestedBudget)
+        if (seq !== requestSeq) return
         allocated.value = data.allocated
         remaining.value = data.remaining
         recommendations.value = data.items
+        loadedBudget.value = requestedBudget
       } catch (err) {
+        if (seq !== requestSeq) return
         error.value = 'Failed to load restock recommendations: ' + err.message
       } finally {
-        loading.value = false
+        if (seq === requestSeq) loading.value = false
       }
     }
+
+    // Recommendations are stale until they match the slider (covers the debounce window)
+    const isStale = computed(() => loadedBudget.value !== budget.value)
 
     // Debounce budget changes so we don't fire a request on every tick of the slider drag
     watch(budget, () => {
@@ -140,6 +152,11 @@ export default {
       debounceTimer = setTimeout(() => {
         loadRecommendations()
       }, 350)
+    })
+
+    onUnmounted(() => {
+      if (debounceTimer) clearTimeout(debounceTimer)
+      requestSeq++
     })
 
     const reasonText = (item) => {
@@ -160,7 +177,7 @@ export default {
         submitting.value = true
         submitError.value = null
         const payload = {
-          budget: budget.value,
+          budget: loadedBudget.value,
           items: recommendations.value.map(r => ({
             sku: r.sku,
             name: r.name,
@@ -201,6 +218,7 @@ export default {
       translateWarehouse,
       reasonText,
       submitting,
+      isStale,
       submitError,
       successMessage,
       placeOrder

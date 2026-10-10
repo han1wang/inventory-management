@@ -149,6 +149,9 @@ export default {
     const loading = ref(true)
     const error = ref(null)
     const orders = ref([])
+    // Restock orders come from their own endpoint: they aren't sales orders and shouldn't
+    // be hidden by FilterBar filters (multi-warehouse orders have warehouse 'Multiple').
+    const submittedOrders = ref([])
 
     // Use shared filters
     const {
@@ -163,7 +166,11 @@ export default {
       try {
         loading.value = true
         const filters = getCurrentFilters()
-        const fetchedOrders = await api.getOrders(filters)
+        const [fetchedOrders, restockOrders] = await Promise.all([
+          api.getOrders(filters),
+          api.getRestockOrders()
+        ])
+        submittedOrders.value = restockOrders
 
         // Sort orders by order_date (earliest first)
         orders.value = fetchedOrders.sort((a, b) => {
@@ -186,10 +193,6 @@ export default {
     const getOrdersByStatus = (status) => {
       return orders.value.filter(order => order.status === status)
     }
-
-    const submittedOrders = computed(() => {
-      return orders.value.filter(order => order.is_restock === true)
-    })
 
     const getOrderStatusClass = (status) => {
       const statusMap = {

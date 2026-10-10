@@ -1,9 +1,9 @@
 import uuid
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
 app = FastAPI(title="Factory Inventory Management System")
@@ -18,6 +18,11 @@ CATEGORY_LEAD_TIMES = {
     'Power Supplies': 12,
 }
 DEFAULT_LEAD_TIME_DAYS = 14
+
+# Restocking orders are internal purchases, not customer sales. They live in their own
+# list so the sales/revenue endpoints that iterate `orders` never count them as revenue.
+restock_orders: List[dict] = []
+MAX_RESTOCK_BUDGET = 10_000_000
 
 # Quarter mapping for date filtering
 QUARTER_MAP = {
@@ -147,12 +152,12 @@ class RestockOrderItem(BaseModel):
     name: str
     category: Optional[str] = None
     warehouse: Optional[str] = None
-    unit_cost: float
-    quantity: int
+    unit_cost: float = Field(gt=0)
+    quantity: int = Field(gt=0)
 
 class CreateRestockOrderRequest(BaseModel):
-    budget: float
-    items: List[RestockOrderItem]
+    budget: float = Field(ge=0, le=MAX_RESTOCK_BUDGET)
+    items: List[RestockOrderItem] = Field(min_length=1)
 
 class PurchaseOrder(BaseModel):
     id: str
@@ -273,8 +278,9 @@ def build_restock_candidates() -> List[dict]:
     return candidates
 
 @app.get("/api/restocking/recommendations", response_model=RestockRecommendationsResponse)
-def get_restock_recommendations(budget: float):
-    """Recommend items to restock within budget, prioritizing backlog urgency then rising demand."""
+def get_restock_recommendations(budget: float = Query(ge=0, le=MAX_RESTOCK_BUDGET)):
+    """Recommend items to restock within budget, prioritizing backlog urgency then rising demand.
+    Budget bounds also reject nan/inf, which would otherwise crash the quantity math."""
     remaining = budget
     recommendations = []
 
@@ -288,7 +294,8 @@ def get_restock_recommendations(budget: float):
         quantity = candidate['quantity']
         full_cost = quantity * unit_cost
         if full_cost > remaining:
-            quantity = int(remaining // unit_cost)
+            # Divide + epsilon instead of float `//`, which can drop a unit (0.3 // 0.1 == 2.0)
+            quantity = int(remaining / unit_cost + 1e-9)
         if quantity <= 0:
             continue
 
@@ -303,19 +310,25 @@ def get_restock_recommendations(budget: float):
         'items': recommendations,
     }
 
+@app.get("/api/restocking/orders", response_model=List[Order])
+def get_restock_orders():
+    """List submitted restocking orders (kept separate from sales orders)."""
+    return restock_orders
+
 @app.post("/api/restocking/orders", response_model=Order)
 def create_restock_order(request: CreateRestockOrderRequest):
-    """Submit a restocking order built from recommended items; appends to the shared in-memory orders list."""
-    if not request.items:
-        raise HTTPException(status_code=400, detail="Order must contain at least one item")
-
+    """Submit a restocking order built from recommended items; stored in restock_orders, not the sales orders list."""
     total_value = round(sum(item.quantity * item.unit_cost for item in request.items), 2)
+    # Small tolerance for float rounding between the recommendation and the submitted order
+    if total_value > request.budget + 0.01:
+        raise HTTPException(status_code=400, detail="Order total exceeds budget")
+
     lead_time_days = max(
-        (CATEGORY_LEAD_TIMES.get(item.category, DEFAULT_LEAD_TIME_DAYS) for item in request.items),
-        default=DEFAULT_LEAD_TIME_DAYS
+        CATEGORY_LEAD_TIMES.get(item.category, DEFAULT_LEAD_TIME_DAYS) for item in request.items
     )
 
-    order_date = datetime.utcnow()
+    # Naive local timestamp without microseconds, matching the format of orders.json
+    order_date = datetime.now().replace(microsecond=0)
     expected_delivery = order_date + timedelta(days=lead_time_days)
 
     categories = {item.category for item in request.items if item.category}
@@ -339,7 +352,7 @@ def create_restock_order(request: CreateRestockOrderRequest):
         'is_restock': True,
         'lead_time_days': lead_time_days,
     }
-    orders.append(new_order)
+    restock_orders.append(new_order)
     return new_order
 
 @app.get("/api/dashboard/summary")

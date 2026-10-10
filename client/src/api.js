@@ -109,6 +109,11 @@ export const api = {
     return response.data
   },
 
+  async getRestockOrders() {
+    const response = await axios.get(`${API_BASE_URL}/restocking/orders`)
+    return response.data
+  },
+
   async submitRestockOrder(payload) {
     const response = await axios.post(`${API_BASE_URL}/restocking/orders`, payload)
     return response.data
